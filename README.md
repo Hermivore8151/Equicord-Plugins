@@ -22,7 +22,9 @@ A simple fake voice plugin that lets you be "muted" or "deafened", even though y
 Do NOT ask for support about this plugin in equicord or vencord, you will likely be muted or timed out (I learnt that the hard way)  
 It also violates discord ToS, but I imagine you don't care about that, as you are already using a custom client.  
 You can toggle them by simply shift-clicking the icon you want to fake, the background will turn purple like displayed:  
+  
 <img width="357" height="477" alt="{ACA3840E-24FA-4332-8A90-1965F4C5B608}" src="https://github.com/user-attachments/assets/0fc9a39a-71fe-4980-8ebc-90719a934992" />  
+  
 There are no settings for this plugin, I could offer a way to change the method of invocation, but I personally felt like that wasn't needed  
   
 # VoiceNoteTranscriptions  
@@ -36,6 +38,7 @@ This queries an API that can run a transcription model, it expects the API to re
 {"text": "transcription"}
 ```
 In the payload, It supports passing an authorization header: 
+  
 <img width="651" height="419" alt="image" src="https://github.com/user-attachments/assets/4582380b-5708-41f1-9cff-bd70479b9f8a" />
   
 # Installation  
@@ -49,6 +52,7 @@ Enjoy!
 # Other  
   
 If you want to motivate me to make more plugins, you can donate at:  
+  
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/L3L71K5ZBB)  
   
 You can message me for support on discord: @hermivore  
