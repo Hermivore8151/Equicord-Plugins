@@ -14,6 +14,16 @@ import {
     PermissionsBits
 } from "@webpack/common";
 
+declare const VencordNative: any;
+
+interface NativeModule {
+    startProxy: () => Promise<number>;
+    stopProxy: () => void;
+}
+
+const Native = VencordNative.pluginHelpers.CustomCdnUploads as NativeModule;
+let proxyPort = 0;
+
 // Icons
 function CdnEnabledIcon() {
     return (
@@ -74,6 +84,11 @@ const settings = definePluginSettings({
         ],
         default: "inject"
     },
+    hyperlinkText: {
+        type: OptionType.STRING,
+        description: "The display text for the markdown link (e.g., 'attachment', 'image'). Leave blank to paste the raw URL without markdown.",
+        default: "attachment",
+    },
     editModeMinSizeMB: {
         type: OptionType.NUMBER,
         description: "Minimum file size (in MB) to use the placeholder method. Smaller files inject immediately.",
@@ -93,6 +108,11 @@ const settings = definePluginSettings({
         type: OptionType.STRING,
         description: "The base CDN URL to PUT files to (must end in /)",
         default: "https://hermivore.cat/cdn/temp/"
+    },
+    stripExtensions: {
+        type: OptionType.BOOLEAN,
+        description: "Strip file extensions from the generated CDN URLs (for pretty URLs).",
+        default: false,
     },
     authHeader: {
         type: OptionType.STRING,
@@ -156,8 +176,57 @@ let finalizedUploadIds = new Set<string>();
 // todo: FIX THE TRACKING AND FALLBACKS
 const completedUploads = new Map<string, { url: string; success: boolean }>();
 let originalSendMessageDescriptor: PropertyDescriptor | undefined;
+const pendingEdits = new Map<string, { channelId: string, replacements: Map<string, string> }>();
+let editCheckInterval: NodeJS.Timeout | null = null;
 
-// Exactly what the function is called
+function startEditCheckInterval() {
+    if (editCheckInterval) return;
+    editCheckInterval = setInterval(() => {
+        if (pendingEdits.size === 0) {
+            clearInterval(editCheckInterval!);
+            editCheckInterval = null;
+            return;
+        }
+        
+        for (const [msgId, { channelId, replacements }] of Array.from(pendingEdits.entries())) {
+            const msg = MessageStore.getMessage(channelId, msgId);
+            // Check if message exists and is fully sent
+            if (msg && (!msg.state || msg.state === "SENT")) {
+                const hasTarget = Array.from(replacements.keys()).some(id => msg.content?.includes(id));
+                if (hasTarget) {
+                    let newContent = msg.content;
+                    for (const [id, replacement] of replacements.entries()) {
+                        const regex = new RegExp(`\\[media uploading\\.\\.\\.\\s*[^\\]]*${id}\\]`, 'g');
+                        newContent = newContent.replace(regex, replacement);
+                    }
+                    if (newContent !== msg.content) {
+                        MessageActions.editMessage(channelId, msgId, { content: newContent.trim() });
+                        
+                        // Verify edit persisted after 1 second
+                        setTimeout(() => {
+                            const updatedMsg = MessageStore.getMessage(channelId, msgId);
+                            if (updatedMsg) {
+                                let stillHasTarget = false;
+                                for (const id of replacements.keys()) {
+                                    if (updatedMsg.content.includes(id)) {
+                                        stillHasTarget = true;
+                                        break;
+                                    }
+                                }
+                                if (stillHasTarget) {
+                                    console.warn("[CustomCdnUploads] Edit did not persist, retrying...");
+                                    MessageActions.editMessage(channelId, msgId, { content: newContent.trim() });
+                                }
+                            }
+                        }, 1000);
+                    }
+                }
+                pendingEdits.delete(msgId);
+            }
+        }
+    }, 500);
+}
+
 function findAndEditMessage(channelId: string, uploadIdsToReplace: Map<string, string>) {
     const messages = MessageStore.getMessages(channelId);
     if (!messages) return;
@@ -176,6 +245,14 @@ function findAndEditMessage(channelId: string, uploadIdsToReplace: Map<string, s
             const hasTarget = Array.from(uploadIdsToReplace.keys()).some(id => m.content?.includes(id));
             
             if (hasTarget) {
+                // If message is still sending, defer it
+                if (m.state && m.state !== "SENT") {
+                    console.log(`[CustomCdnUploads] Deferring edit for message ${m.id} (state: ${m.state})`);
+                    pendingEdits.set(m.id, { channelId, replacements: uploadIdsToReplace });
+                    startEditCheckInterval();
+                    return;
+                }
+
                 let newContent = m.content;
                 for (const [id, replacement] of uploadIdsToReplace.entries()) {
                     const regex = new RegExp(`\\[media uploading\\.\\.\\.\\s*[^\\]]*${id}\\]`, 'g');
@@ -184,6 +261,24 @@ function findAndEditMessage(channelId: string, uploadIdsToReplace: Map<string, s
                 
                 if (newContent.trim().length > 0 && newContent !== m.content) {
                     MessageActions.editMessage(channelId, m.id, { content: newContent.trim() });
+                    
+                    // Verify edit persisted
+                    setTimeout(() => {
+                        const updatedMsg = MessageStore.getMessage(channelId, m.id);
+                        if (updatedMsg) {
+                            let stillHasTarget = false;
+                            for (const id of uploadIdsToReplace.keys()) {
+                                if (updatedMsg.content.includes(id)) {
+                                    stillHasTarget = true;
+                                    break;
+                                }
+                            }
+                            if (stillHasTarget) {
+                                console.warn("[CustomCdnUploads] Edit did not persist, retrying...");
+                                MessageActions.editMessage(channelId, m.id, { content: newContent.trim() });
+                            }
+                        }
+                    }, 1000);
                 }
                 return;
             }
@@ -258,21 +353,29 @@ const handleUpload = async (e: Event) => {
     for (const file of files) {
         const timestamp = Date.now();
         const ext = file.name.includes('.') ? file.name.split('.').pop() : 'bin';
-        const filename = `${timestamp}_${Math.random().toString(36).substring(2, 8)}.${ext}`;
-        const targetUrl = `${settings.store.cdnUrl}${filename}`;
+        const baseFilename = `${timestamp}_${Math.random().toString(36).substring(2, 8)}`;
+        const filename = settings.store.stripExtensions ? baseFilename : `${baseFilename}.${ext}`;
+        const realTargetUrl = `${settings.store.cdnUrl}${filename}`;
+        const proxyUrl = proxyPort 
+            ? `http://127.0.0.1:${proxyPort}/upload/${encodeURIComponent(realTargetUrl)}`
+            : realTargetUrl;
         
         const uploadId = Math.random().toString(36).substring(2, 9);
         const isLargeFile = file.size > (settings.store.editModeMinSizeMB * 1024 * 1024);
         const usePlaceholder = settings.store.uploadMode === "edit" && isLargeFile;
 
+        // Check if they want markdown or a raw URL
+        const linkText = settings.store.hyperlinkText?.trim();
+        const formattedUrl = linkText ? `[${linkText}](${realTargetUrl})` : realTargetUrl;
+
         if (usePlaceholder) {
             insertTextIntoChatInputBox(`[media uploading... ${uploadId}] `);
         } else {
-            insertTextIntoChatInputBox(`[attachment](${targetUrl}) `);
+            insertTextIntoChatInputBox(`${formattedUrl} `);
         }
 
         const xhr = new XMLHttpRequest();
-        xhr.open("PUT", targetUrl, true);
+        xhr.open("PUT", proxyUrl, true);
         xhr.setRequestHeader("Authorization", settings.store.authHeader);
         xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
 
@@ -313,7 +416,13 @@ const handleUpload = async (e: Event) => {
 
             completedFilesInBatch++;
             const success = xhr.status >= 200 && xhr.status < 300;
-            const resultUrl = success ? `[attachment](${targetUrl})` : "[upload failed]";
+            
+            let resultUrl = "[upload failed]";
+            if (success) {
+                const linkText = settings.store.hyperlinkText?.trim();
+                // If linkText is empty, fallback to raw URL
+                resultUrl = linkText ? `[${linkText}](${realTargetUrl})` : realTargetUrl;
+            }
             
             completedUploads.set(uploadId, { url: resultUrl, success });
 
@@ -471,16 +580,23 @@ export default definePlugin({
     name: "CustomCdnUploads",
     description: "Intercepts file uploads and PUTs them to a custom CDN. Includes fallbacks, coalesced progress editing, and DOM-level send blocking.",
     authors: [{ name: "Hermivore", id: 559811983512305693n }], 
-    website: "https://hermivore.cat/", // why cant we do this?
-    source: "https://hermivore.cat/cdn/discord/plugins/CDNUpload/index.tsx", // and this?
+    website: "https://hermivore.cat/",
+    source: "https://hermivore.cat/cdn/discord/plugins/CDNUpload/index.tsx",
     settings,
 
     chatBarButton: {
         render: ToggleButton 
     },
 
-    start() {
+    async start() {
         currentState.enabled = settings.store.alwaysUseCdn;
+        try {
+            proxyPort = await Native.startProxy();
+        } catch (e) {
+            console.error("[CustomCdnUploads] Failed to start proxy:", e);
+        }
+        
+        document.addEventListener("paste", handleUpload, true);
         
         document.addEventListener("paste", handleUpload, true);
         document.addEventListener("drop", handleUpload, true);
@@ -520,6 +636,8 @@ export default definePlugin({
         document.removeEventListener("drop", handleUpload, true);
         document.removeEventListener("keydown", handleSendIntercept, true);
         document.removeEventListener("click", handleSendIntercept, true);
+
+        if (Native && typeof Native.stopProxy === "function") Native.stopProxy();
         
         // Clean up monkey-patch (learnt this one the hard way)
         if (originalSendMessageDescriptor) {
