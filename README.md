@@ -24,6 +24,7 @@ It also violates discord ToS, but I imagine you don't care about that, as you ar
 You can toggle them by simply shift-clicking the icon you want to fake, the background will turn purple like displayed:  
   
 <img width="357" height="477" alt="{ACA3840E-24FA-4332-8A90-1965F4C5B608}" src="https://github.com/user-attachments/assets/0fc9a39a-71fe-4980-8ebc-90719a934992" />  
+As of November 2026, The way i have to patch it no longer displays what the other people see in the voice channel, however the icons will still be highlighted. If someone who actually understands TS can fix it, feel free to.  
   
 There are no settings for this plugin, I could offer a way to change the method of invocation, but I personally felt like that wasn't needed  
   
