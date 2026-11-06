@@ -1,11 +1,7 @@
 import definePlugin from "@utils/types";
 import { findByProps } from "@webpack";
 
-let isFakeMuted = false;
-let isFakeDeafened = false;
-let originalSend: any;
-
-// CSS
+// CSS — unchanged, your original selectors work fine
 const STYLE_ID = "hermivore-fake-voice-css";
 const cssContent = `
     body.hermivore-fake-mute [aria-label="Mute"],
@@ -16,7 +12,7 @@ const cssContent = `
     body.hermivore-fake-mute [aria-label="Unmute"] svg {
         color: white !important;
     }
-    
+
     body.hermivore-fake-deafen [aria-label="Deafen"],
     body.hermivore-fake-deafen [aria-label="Undeafen"] {
         background-color: var(--brand-500) !important;
@@ -38,118 +34,55 @@ function injectCSS() {
 }
 
 function removeCSS() {
-    const style = document.getElementById(STYLE_ID);
-    if (style) style.remove();
+    document.getElementById(STYLE_ID)?.remove();
 }
 
-// WS Patch
-function patchSocket() {
-    const wsModule = findByProps("getSocket");
-    if (!wsModule) return;
-    
-    const socket = wsModule.getSocket();
-    if (!socket) return;
-
-    if ((socket.send as any).__fakeVoicePatched) return;
-
-    originalSend = socket.send;
-    
-    const patchedSend = function (op: number, data: any, ...args: any[]) {
-        // Opcode 4 is VOICE_STATE_UPDATE
-        if (op === 4 && data) {
-            if (isFakeMuted) data.self_mute = true;
-            if (isFakeDeafened) data.self_deaf = true;
-        }
-        return originalSend.apply(this, [op, data, ...args]);
-    };
-    
-    (patchedSend as any).__fakeVoicePatched = true;
-    socket.send = patchedSend;
-}
-
-function unpatchSocket() {
-    if (!originalSend) return;
-    const wsModule = findByProps("getSocket");
-    if (wsModule) {
-        const socket = wsModule.getSocket();
-        if (socket) {
-            socket.send = originalSend;
-        }
-    }
-    originalSend = null;
-}
-
-// Server State Syncing
-// Manually forces the server to see the correct state
-function refreshServerState() {
-    const wsModule = findByProps("getSocket");
+// Forces Discord to emit VOICE_STATE_UPDATE payloads (which our webpack patch
+// rewrites) while returning the local media engine to its original state.
+function syncState() {
+    // NOTE: the action is "toggleSelfDeaf", NOT "toggleSelfDeafen"!
+    const VoiceActions = findByProps("toggleSelfMute");
     const SelectedChannelStore = findByProps("getVoiceChannelId");
-    const ChannelStore = findByProps("getChannel", "getDMFromUserId");
-    const MediaEngineStore = findByProps("isDeaf", "isMute");
-    
-    if (!wsModule || !SelectedChannelStore || !ChannelStore) return;
-    
-    const socket = wsModule.getSocket();
-    const channelId = SelectedChannelStore.getVoiceChannelId();
-    const channel = channelId ? ChannelStore.getChannel(channelId) : null;
-    
-    if (socket && channelId) {
-        // Read the actual local state (which hasn't changed because we blocked the click)
-        const actualMute = MediaEngineStore?.isMute() ?? false;
-        const actualDeaf = MediaEngineStore?.isDeaf() ?? false;
 
-        socket.send(4, {
-            guild_id: channel?.guild_id ?? null,
-            channel_id: channelId,
-            self_mute: isFakeMuted || actualMute,
-            self_deaf: isFakeDeafened || actualDeaf,
-            self_video: false,
-            flags: 0
-        });
-    }
+    if (!VoiceActions || !SelectedChannelStore?.getVoiceChannelId()) return;
+
+    VoiceActions.toggleSelfMute();
+    VoiceActions.toggleSelfMute();
+    VoiceActions.toggleSelfDeaf();
+    VoiceActions.toggleSelfDeaf();
 }
 
-// UI Logic
+// UI Logic — unchanged, your original detection works fine
 function handleShiftClick(e: MouseEvent) {
-    if (!e.shiftKey) return;
+    if (!e.shiftKey || !plugin) return;
 
     const target = e.target as HTMLElement;
     const muteBtn = target.closest('[aria-label="Mute"], [aria-label="Unmute"]');
     const deafenBtn = target.closest('[aria-label="Deafen"], [aria-label="Undeafen"]');
 
     if (muteBtn) {
-        // Block the event completely so Discord's native onClick never fires
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
-        
-        isFakeMuted = !isFakeMuted;
-        
-        if (isFakeMuted) {
-            document.body.classList.add("hermivore-fake-mute");
-        } else {
-            document.body.classList.remove("hermivore-fake-mute");
-        }
-        refreshServerState();
+
+        plugin.isFakeMuted = !plugin.isFakeMuted;
+        document.body.classList.toggle("hermivore-fake-mute", plugin.isFakeMuted);
+        syncState();
     }
 
     if (deafenBtn) {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
-        
-        isFakeDeafened = !isFakeDeafened;
-        
-        if (isFakeDeafened) {
-            document.body.classList.add("hermivore-fake-deafen");
-        } else {
-            document.body.classList.remove("hermivore-fake-deafen");
-        }
-        refreshServerState();
+
+        plugin.isFakeDeafened = !plugin.isFakeDeafened;
+        document.body.classList.toggle("hermivore-fake-deafen", plugin.isFakeDeafened);
+        syncState();
     }
 }
 
-// Plugin definition
+let plugin: any = null;
+
 export default definePlugin({
     name: "FakeVoice",
     description: "Shift+Click the Mute/Deafen buttons to fake it. The server thinks you're muted/deafened, but you can still speak/hear. Buttons turn Blurple.",
@@ -157,20 +90,35 @@ export default definePlugin({
     website: "https://hermivore.cat/",
     source: "https://hermivore.cat/cdn/discord/plugins/FakeVoice/index.tsx",
 
+    // Live on the plugin instance so $self can read them inside the patch
+    isFakeMuted: false,
+    isFakeDeafened: false,
+
+    patches: [
+        {
+            // Intercepts the gateway payload builder, before any socket transport
+            find: "}voiceStateUpdate(",
+            replacement: {
+                match: /self_mute:([^,]+),self_deaf:([^,]+),self_video:([^,]+)/,
+                replace: "self_mute:$1||$self.isFakeMuted,self_deaf:$2||$self.isFakeDeafened,self_video:$3"
+            }
+        }
+    ],
+
     start() {
+        plugin = this;
         injectCSS();
-        patchSocket();
         document.addEventListener("click", handleShiftClick, true);
     },
 
     stop() {
         removeCSS();
-        unpatchSocket();
         document.removeEventListener("click", handleShiftClick, true);
         document.body.classList.remove("hermivore-fake-mute");
         document.body.classList.remove("hermivore-fake-deafen");
-        
-        isFakeMuted = false;
-        isFakeDeafened = false;
+
+        this.isFakeMuted = false;
+        this.isFakeDeafened = false;
+        plugin = null;
     }
 });
