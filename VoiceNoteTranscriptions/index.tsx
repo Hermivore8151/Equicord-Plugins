@@ -3,6 +3,16 @@ import definePlugin, { OptionType } from "@utils/types";
 import { addMessageAccessory } from "@api/MessageAccessories";
 import { React } from "@webpack/common";
 
+declare const VencordNative: any;
+
+interface NativeModule {
+    startProxy: () => Promise<number>;
+    stopProxy: () => void;
+}
+
+const Native = VencordNative.pluginHelpers.VoiceNoteTranscriptions as NativeModule;
+let proxyPort = 0;
+
 const settings = definePluginSettings({
     apiUrl: {
         type: OptionType.STRING,
@@ -22,23 +32,29 @@ function TranscriptionAccessory({ message }) {
     const [error, setError] = React.useState(false);
 
     React.useEffect(() => {
-        // Find the voice note attachment
         const audioAtt = message.attachments?.find(a => a.waveform || a.content_type?.startsWith("audio/"));
         if (!audioAtt) { 
             setLoading(false); 
             return; 
         }
 
-        // DEFER heavy work to prevent UI blocking
-        // This allows the UI to render first, then process in the background
         const transcribe = () => {
-            fetch(audioAtt.url)
+            // Fallback to proxy_url just in case direct CDN fetches are blocked in edge cases
+            const audioUrl = audioAtt.proxy_url || audioAtt.url;
+
+            fetch(audioUrl)
                 .then(r => r.blob())
                 .then(blob => {
                     const form = new FormData();
                     form.append("audio", blob, "voice_note.ogg");
                     
-                    return fetch(settings.store.apiUrl, {
+                    // Route through the local Node proxy to bypass Discord's CSP
+                    const targetUrl = settings.store.apiUrl;
+                    const proxyUrl = proxyPort 
+                        ? `http://127.0.0.1:${proxyPort}/stt/${encodeURIComponent(targetUrl)}`
+                        : targetUrl;
+
+                    return fetch(proxyUrl, {
                         method: "POST",
                         headers: { "Authorization": settings.store.authHeader },
                         body: form
@@ -60,7 +76,6 @@ function TranscriptionAccessory({ message }) {
                 .finally(() => setLoading(false));
         };
 
-        // Use requestIdleCallback if available, otherwise setTimeout
         if (typeof requestIdleCallback === 'function') {
             requestIdleCallback(() => transcribe(), { timeout: 2000 });
         } else {
@@ -84,7 +99,7 @@ function TranscriptionAccessory({ message }) {
             fontSize: 14, 
             borderLeft: "3px solid var(--brand-500)",
             maxWidth: "600px",
-            lineHeight: 1.4 // Better readability
+            lineHeight: 1.4
         }}>
             <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 4, textTransform: "uppercase", fontWeight: "bold", letterSpacing: "0.5px" }}>
                 Transcription
@@ -102,7 +117,14 @@ export default definePlugin({
     source: "https://hermivore.cat/cdn/discord/plugins/VoiceNoteTranscriptions/index.tsx",
     settings,
 
-    start() {
+    async start() {
+        // Initialize the local proxy
+        try {
+            proxyPort = await Native.startProxy();
+        } catch (e) {
+            console.error("[VoiceNoteTranscriptions] Failed to start proxy:", e);
+        }
+
         addMessageAccessory("VoiceNoteTranscriptions", props => {
             const isVoiceNote = props.message.attachments?.some(a => a.waveform || a.content_type?.startsWith("audio/"));
             if (!isVoiceNote) return null;
@@ -112,6 +134,9 @@ export default definePlugin({
     },
 
     stop() {
-        // Equicord automatically cleans up accessories when the plugin stops, so I should be fine?
+        // Clean up the proxy server when the plugin stops
+        if (Native && typeof Native.stopProxy === "function") {
+            Native.stopProxy();
+        }
     }
 });
